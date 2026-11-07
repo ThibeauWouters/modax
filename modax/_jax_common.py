@@ -63,6 +63,27 @@ def normalize_y0_params(
     return y0_arr, params_arr, n, y0_arr.shape[1]
 
 
+def _grouped_y0_params(
+    y0: ArrayLike, params: ArrayLike, group: int
+) -> tuple[jax.Array, jax.Array, int, int]:
+    """Check the shapes of a solve whose trajectories share ``params`` rows in groups of ``group``."""
+    y0_arr = jnp.asarray(y0, dtype=jnp.float64)
+    params_arr = jnp.asarray(params, dtype=jnp.float64)
+    if y0_arr.ndim != 2 or params_arr.ndim != 2:
+        raise ValueError(
+            "params_group_size > 1 needs y0 of shape (N, n_vars) and params of shape "
+            f"(N / params_group_size, n_params); got y0.shape={y0_arr.shape} and "
+            f"params.shape={params_arr.shape}"
+        )
+    n = y0_arr.shape[0]
+    if params_arr.shape[0] * group != n:
+        raise ValueError(
+            f"params_group_size={group} needs params with {n} / {group} rows, one per "
+            f"group of trajectories; got {params_arr.shape[0]} rows for {n} trajectories"
+        )
+    return y0_arr, params_arr, n, y0_arr.shape[1]
+
+
 @dataclass(frozen=True)
 class EnsembleInputs:
     """The array inputs of one launch, in kernel order, and the extents behind them.
@@ -103,13 +124,22 @@ def prepare_inputs(
     params: ArrayLike,
     settings: SolveSettings,
     spec: SensitivitySpec | None,
+    *,
+    params_group_size: int = 1,
 ) -> EnsembleInputs:
     """Normalise a solve's arguments into the arrays the kernel reads.
 
     With a ``spec`` the kernel integrates the joint ``[y, S]`` system, so the
     initial state and the error weights are widened to the augmented extent.
+    With ``params_group_size > 1`` consecutive trajectories share one row of
+    ``params``, which then has ``N / params_group_size`` rows.
     """
-    y0_arr, params_arr, n, n_vars = normalize_y0_params(y0, params)
+    if params_group_size > 1:
+        y0_arr, params_arr, n, n_vars = _grouped_y0_params(
+            y0, params, params_group_size
+        )
+    else:
+        y0_arr, params_arr, n, n_vars = normalize_y0_params(y0, params)
     weights = build_error_weights(settings.error_weights, n, n_vars)
     if spec is not None:
         y0_arr = augmented_y0(y0_arr, spec)

@@ -37,7 +37,10 @@ ABI_SCALAR_I32 = 2
 
 @dataclass(frozen=True)
 class CudaLaunch:
-    """Compiled CUDA kernel launch metadata for an XLA FFI call."""
+    """Compiled CUDA kernel launch metadata for an XLA FFI call.
+
+    ``function`` is the kernel id the launcher resolves through its registry (see `compile_kernel`).
+    """
 
     function: int
     grid: tuple[int, int, int]
@@ -74,6 +77,7 @@ def _source() -> str:
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xla/ffi/api/ffi.h"
@@ -83,6 +87,28 @@ namespace ffi = xla::ffi;
 using CuLaunchKernel = int (*)(void*, unsigned int, unsigned int, unsigned int,
                                unsigned int, unsigned int, unsigned int,
                                unsigned int, void*, void**, void**);
+
+// Kernels are identified by a stable 64-bit id in the FFI attributes, so the lowered program does not
+// depend on the process; Python registers the id -> CUfunction mapping when it loads a kernel.
+static std::mutex& KernelsMutex() {
+  static std::mutex m;
+  return m;
+}
+static std::unordered_map<int64_t, void*>& Kernels() {
+  static std::unordered_map<int64_t, void*> m;
+  return m;
+}
+
+extern "C" void modax_register_kernel(int64_t id, void* function) {
+  std::lock_guard<std::mutex> lock(KernelsMutex());
+  Kernels()[id] = function;
+}
+
+static void* LookupKernel(int64_t id) {
+  std::lock_guard<std::mutex> lock(KernelsMutex());
+  auto it = Kernels().find(id);
+  return it == Kernels().end() ? nullptr : it->second;
+}
 
 static CuLaunchKernel LoadCuLaunchKernel() {
   static std::once_flag once;
@@ -200,7 +226,13 @@ static ffi::Error LaunchNumbaCudaAbi(
                       "kernel ABI kinds did not consume all buffers");
   }
 
-  int err = cuLaunchKernel(reinterpret_cast<void*>(function),
+  void* kernel = LookupKernel(function);
+  if (kernel == nullptr) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "modax kernel id " + std::to_string(function) +
+                          " is not registered in this process");
+  }
+  int err = cuLaunchKernel(kernel,
                            static_cast<unsigned int>(grid_x),
                            static_cast<unsigned int>(grid_y),
                            static_cast<unsigned int>(grid_z),
@@ -279,6 +311,8 @@ def register_target() -> None:
     assert address is not None
     capsule = _pycapsule_new(address)
     jax.ffi.register_ffi_target(_TARGET_NAME, capsule, platform="CUDA", api_version=1)
+    _LOADED_LIB.modax_register_kernel.argtypes = [ctypes.c_int64, ctypes.c_void_p]
+    _LOADED_LIB.modax_register_kernel.restype = None
     _REGISTERED = True
 
 
@@ -349,8 +383,10 @@ def target_kernel(kernel: MLIRDispatcher) -> MLIRDispatcher:
     return kernel
 
 
-def compile_kernel(kernel: MLIRDispatcher, argtypes: Sequence[Type]) -> int:
-    """Compile a ``cuda.jit`` kernel and return its ``CUfunction`` pointer.
+def compile_kernel(
+    kernel: MLIRDispatcher, argtypes: Sequence[Type], cache_key: str | None = None
+) -> int:
+    """Compile a ``cuda.jit`` kernel, load it and return the id its FFI call carries.
 
     The kernel is compiled for `compile_target`, which differs from the GPU
     only on Blackwell.
@@ -359,11 +395,24 @@ def compile_kernel(kernel: MLIRDispatcher, argtypes: Sequence[Type]) -> int:
     offers the textual IR.  The linked cubin and the mangled entry name are on
     the compile result's metadata instead, so load the module through the driver
     and look the function up by name.
-    """
 
-    cres = target_kernel(kernel).compile(tuple(argtypes)).cres
-    cubin = cres.metadata["cubin"]
-    func_name = cres.metadata["func_name"]
+    With a ``cache_key`` (see `modax._kernel_cache`) the cubin is read from the
+    disk cache if present and written to it otherwise, and the id is derived from
+    the key, so it is the same in every process. Without one the id is the
+    ``CUfunction`` pointer itself, as before. Either way the launcher resolves the
+    id through a per-process registry filled here.
+    """
+    from modax import _kernel_cache
+
+    cached = _kernel_cache.load(cache_key) if cache_key is not None else None
+    if cached is not None:
+        cubin, func_name = cached
+    else:
+        cres = target_kernel(kernel).compile(tuple(argtypes)).cres
+        cubin = cres.metadata["cubin"]
+        func_name = cres.metadata["func_name"]
+        if cache_key is not None:
+            _kernel_cache.store(cache_key, bytes(cubin), func_name)
 
     libcuda = ctypes.CDLL("libcuda.so.1")
     module = ctypes.c_void_p()
@@ -380,7 +429,13 @@ def compile_kernel(kernel: MLIRDispatcher, argtypes: Sequence[Type]) -> int:
         raise RuntimeError(f"cuModuleGetFunction failed with CUDA driver error {err}")
     if function.value is None:
         raise RuntimeError("cuModuleGetFunction returned a null function pointer")
-    return int(function.value)
+
+    # 60 bits of the key keep the id positive in an int64 attribute.
+    kernel_id = int(cache_key[:15], 16) if cache_key is not None else int(function.value)
+    register_target()
+    assert _LOADED_LIB is not None
+    _LOADED_LIB.modax_register_kernel(kernel_id, function)
+    return kernel_id
 
 
 def make_launch(
@@ -390,6 +445,7 @@ def make_launch(
     grid: int | Sequence[int],
     block: int | Sequence[int],
     shared_mem: int = 0,
+    cache_key: str | None = None,
 ) -> CudaLaunch:
     """Compile ``kernel`` for ``argtypes`` and bundle it with its launch geometry.
 
@@ -397,7 +453,7 @@ def make_launch(
     three; ``shared_mem`` is the dynamic shared memory per block, in bytes.
     """
     return CudaLaunch(
-        function=compile_kernel(kernel, argtypes),
+        function=compile_kernel(kernel, argtypes, cache_key),
         grid=_as_3d(grid),
         block=_as_3d(block),
         shared_mem=int(shared_mem),

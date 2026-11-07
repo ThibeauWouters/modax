@@ -20,6 +20,7 @@ from modax._jax_common import (
     prepare_inputs,
 )
 from modax._jax_numba_custom_call import CudaLaunch, make_launch
+from modax._kernel_cache import kernel_key
 from modax._numba_common import (
     SOLVER_ARGTYPES,
     OdeFn,
@@ -146,6 +147,7 @@ class KernelOptions:
     gains: PIDGains = PIDGains()
     backend: Backend = "auto"
     spec: SensitivitySpec | None = None
+    params_group_size: int = 1
 
     def uses_shared(self, n: int, n_system: int) -> bool:
         """Whether an ensemble of ``n`` systems of ``n_system`` components runs the shared-memory kernel."""
@@ -183,7 +185,11 @@ def clear_caches() -> None:
 
 @functools.cache
 def _make_body(
-    ode_fn: OdeFn, n_vars: int, gains: PIDGains, spec: SensitivitySpec | None
+    ode_fn: OdeFn,
+    n_vars: int,
+    gains: PIDGains,
+    spec: SensitivitySpec | None,
+    params_group_size: int = 1,
 ) -> MLIRDispatcher:
     """Build the per-trajectory Tsit5 integration loop as a CUDA device function.
 
@@ -208,6 +214,7 @@ def _make_body(
         ode_write = make_augmented_local_writer(ode_fn, spec)
         n_system = spec.n_aug
     n_error = n_vars if spec is None else spec.n_error
+    group = params_group_size
 
     @cuda.jit(device=True)
     def body(
@@ -234,7 +241,8 @@ def _make_body(
         k7,
         i,
     ):
-        prow = params[i]
+        # Consecutive trajectories may share one row (``params_group_size``); 1 is one row each.
+        prow = params[i // group]
         for j in range(n_system):
             y[j] = y0[i, j]
             hist[i, 0, j] = y0[i, j]
@@ -420,6 +428,7 @@ def _make_kernel(
     gains: PIDGains,
     spec: SensitivitySpec | None,
     shared: bool,
+    params_group_size: int = 1,
 ) -> MLIRDispatcher:
     """Build a Tsit5 kernel: one thread per trajectory, storage chosen by ``shared``.
 
@@ -432,7 +441,7 @@ def _make_kernel(
     does a local array. Every thread touches only its own column, so nothing
     synchronises and a thread past the ensemble's end simply leaves.
     """
-    body = _make_body(ode_fn, n_vars, gains, spec)
+    body = _make_body(ode_fn, n_vars, gains, spec, params_group_size)
     n_system = n_vars if spec is None else spec.n_aug
 
     if not shared:
@@ -615,12 +624,18 @@ def _make_jax_launch(
     gains: PIDGains,
     spec: SensitivitySpec | None,
     shared: bool,
+    params_group_size: int = 1,
 ) -> CudaLaunch:
     """Compile, load and size the kernel behind one JAX-side ensemble launch."""
-    kernel = _make_kernel(ode_fn, n_vars, gains, spec, shared)
+    kernel = _make_kernel(ode_fn, n_vars, gains, spec, shared, params_group_size)
     threads = _SHARED_BLOCK if shared else _LOCAL_BLOCK
     blocks = (n + threads - 1) // threads
-    return make_launch(kernel, SOLVER_ARGTYPES, grid=blocks, block=threads)
+    # Everything the kernel is built from; None (no disk cache) if the right-hand side reads something the
+    # fingerprint cannot see. The launch geometry is not part of it: the cubin does not depend on it.
+    cache_key = kernel_key("tsit5", ode_fn, n_vars, gains, spec, shared, params_group_size)
+    return make_launch(
+        kernel, SOLVER_ARGTYPES, grid=blocks, block=threads, cache_key=cache_key
+    )
 
 
 @overload
@@ -642,6 +657,7 @@ def solve(
     backend: Backend = "auto",
     sens_error_control: bool = True,
     sens_param_columns: Sequence[int] | None = None,
+    params_group_size: int = 1,
 ) -> jax.Array: ...
 
 
@@ -664,6 +680,7 @@ def solve(
     backend: Backend = "auto",
     sens_error_control: bool = True,
     sens_param_columns: Sequence[int] | None = None,
+    params_group_size: int = 1,
 ) -> tuple[jax.Array, SolverStats]: ...
 
 
@@ -686,6 +703,7 @@ def solve(
     backend: Backend = "auto",
     sens_error_control: bool = True,
     sens_param_columns: Sequence[int] | None = None,
+    params_group_size: int = 1,
 ) -> SolveOutput: ...
 
 
@@ -707,6 +725,7 @@ def solve(
     backend: Backend = "auto",
     sens_error_control: bool = True,
     sens_param_columns: Sequence[int] | None = None,
+    params_group_size: int = 1,
 ) -> SolveOutput:
     """JAX-callable Tsit5 custom-kernel solve.
 
@@ -742,6 +761,13 @@ def solve(
             components take part in step-size control; see below.
         sens_param_columns: Restrict the parameter sensitivities to these
             ``params`` columns; ``None`` carries every column.
+        params_group_size: Number of consecutive trajectories that share one
+            ``params`` row: trajectory ``i`` reads row ``i // params_group_size``,
+            and ``params`` then has ``N / params_group_size`` rows. Meant for
+            large per-group tables (for instance an equation of state shared by
+            many stars), which are then stored and read once per group. Needs a
+            batched ``y0``; not differentiable and not supported under an outer
+            ``jax.vmap``.
 
     Returns:
         The history, ``(N, n_save, n_vars)``, followed by the stats dict when
@@ -771,13 +797,22 @@ def solve(
     to ``rtol``.
     """
 
-    options = KernelOptions(PIDGains(pcoeff, icoeff, dcoeff), backend)
+    if params_group_size < 1:
+        raise ValueError(f"params_group_size must be >= 1; got {params_group_size}")
+    options = KernelOptions(
+        PIDGains(pcoeff, icoeff, dcoeff), backend, params_group_size=params_group_size
+    )
     settings = SolveSettings(rtol, atol, first_step, max_steps, error_weights)
 
     # The JVP rule wraps the vmap-aware solvers rather than the other way
     # round: custom_vmap's own JVP path instantiates symbolic zeros, which is
     # what tells the rule which sensitivity blocks it has to integrate.
     def solver_for(spec: SensitivitySpec | None) -> Solver:
+        if spec is not None and params_group_size > 1:
+            raise NotImplementedError(
+                "params_group_size > 1 is not differentiable: the sensitivities of a "
+                "shared row would have to be summed over its group"
+            )
         return make_custom_vmap_solver(
             functools.partial(
                 _solve_impl,
@@ -808,10 +843,23 @@ def _solve_impl(
     settings: SolveSettings,
     return_stats: bool,
 ) -> SolveOutput:
-    inputs = prepare_inputs(y0, t_span, params, settings, options.spec)
+    inputs = prepare_inputs(
+        y0,
+        t_span,
+        params,
+        settings,
+        options.spec,
+        params_group_size=options.params_group_size,
+    )
     shared = options.uses_shared(inputs.n, inputs.n_system)
     launch = _make_jax_launch(
-        ode_fn, inputs.n, inputs.n_vars, options.gains, options.spec, shared
+        ode_fn,
+        inputs.n,
+        inputs.n_vars,
+        options.gains,
+        options.spec,
+        shared,
+        options.params_group_size,
     )
     # No global scratch either way: the kernel keeps the state and the stage
     # vectors on chip or in thread-local memory.
